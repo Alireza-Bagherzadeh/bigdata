@@ -1,133 +1,177 @@
 import requests
 import sys
 import time
-from collections import defaultdict
+import re
+from collections import OrderedDict, defaultdict
+from datetime import datetime
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-# API base URL
 BASE_URL = "https://v2.jokeapi.dev/joke/Programming"
 
-# Lossy Counting Algorithm Class
-class LossyCounting:
-    def __init__(self, epsilon):
+STOP_WORDS = {
+    'the', 'and', 'a', 'an', 'to', 'in', 'of', 'for', 'on', 'with', 
+    'that', 'this', 'it', 'is', 'are', 'be', 'as', 'at', 'by', 'so'
+}
+
+class TextProcessor:
+    @staticmethod
+    def clean_and_generate_itemsets(text, max_length=4):
+        text = re.sub(r'[^\w\s]', '', text.lower())
+        words = [word for word in text.split() 
+                if word not in STOP_WORDS and len(word) > 2]
+        
+        itemsets = []
+        for i in range(len(words)):
+            for j in range(1, max_length+1):
+                if i+j <= len(words):
+                    itemset = ' '.join(words[i:i+j])
+                    itemsets.append(itemset)
+        return itemsets
+
+class EnhancedLossyCounting:
+    def __init__(self, epsilon=0.25):
         self.epsilon = epsilon
         self.window_size = int(1 / epsilon)
         self.current_window = 1
-        self.data = defaultdict(int)
-        self.bucket_map = {}  # Track the minimum bucket for each item
+        self.global_items = OrderedDict()
+        self.window_history = []
 
-    def add(self, item):
-        # Add or increment the count for the item
-        if item in self.data:
-            self.data[item] += 1
-        else:
-            self.data[item] = 1
-            self.bucket_map[item] = self.current_window - 1
+    def add(self, itemsets):
+        current_time = datetime.now()
+        self.window_history.append({
+            'timestamp': current_time,
+            'itemsets': itemsets
+        })
 
-        # Check if the current window has reached its size limit
-        if sum(self.data.values()) >= self.current_window * self.window_size:
-            self._trim_data()
+        # Update global counts
+        for itemset in itemsets:
+            if itemset in self.global_items:
+                self.global_items[itemset]['count'] += 1
+                self.global_items[itemset]['last_seen'] = current_time
+            else:
+                self.global_items[itemset] = {
+                    'count': 1,
+                    'first_seen': current_time,
+                    'last_seen': current_time
+                }
 
-    def _trim_data(self):
-        print(f"\n[Trim Triggered] Window: {self.current_window}")
-        # Identify items to remove (low-frequency items)
-        items_to_remove = [
-            item for item in self.data
-            if self.data[item] + self.bucket_map[item] <= self.current_window
-        ]
-        # Remove items
-        for item in items_to_remove:
-            print(f"Removing low-frequency item: {item}")
-            del self.data[item]
-            del self.bucket_map[item]
+        # Window management
+        if len(self.window_history) > self.window_size:
+            self._manage_windows()
 
-        # Increment the window counter
+    def _manage_windows(self):
+        oldest_window = self.window_history.pop(0)
+        print(f"\n{'='*30}\n[Window Management] Removing window from {oldest_window['timestamp'].strftime('%H:%M:%S')}")
+        
+        # Decrement counts for old itemsets
+        for itemset in oldest_window['itemsets']:
+            if itemset in self.global_items:
+                self.global_items[itemset]['count'] -= 1
+                if self.global_items[itemset]['count'] <= 0:
+                    del self.global_items[itemset]
+        
         self.current_window += 1
 
-    def get_frequencies(self, threshold):
-        # Return items whose count exceeds the threshold
-        return {
-            item: count
-            for item, count in self.data.items()
-            if count >= threshold
-        }
+    def get_frequent_itemsets(self, threshold=2):
+        return {k: v for k, v in self.global_items.items() if v['count'] >= threshold}
 
-# Function to fetch jokes based on parameters
-def fetch_jokes(
-    category="Programming",  # Joke category
-    language="en",
-    blacklist_flags=None,    # Flags to blacklist (e.g., "nsfw,political")
-    response_format="json",  # Response format: json, xml, yaml, or plain text
-    joke_type="single",      # Joke type: single or twopart
-    search_string=None,      # Search for jokes containing specific text
-    id_range=None,           # Joke ID range (e.g., "0-1367")
-    amount=1                 # Number of jokes to fetch
-):
-    # Build the query parameters
-    params = {
-        "type": joke_type,
-        "lang": language,
-        "amount": amount,
-    }
-    if blacklist_flags:
-        params["blacklistFlags"] = blacklist_flags
-    if search_string:
-        params["contains"] = search_string
-    if id_range:
-        params["idRange"] = id_range
-
-    # Send the GET request
-    try:
-        response = requests.get(BASE_URL, params=params)
-        response.raise_for_status()
-        jokes = response.json()
-
-        # Process the response
-        if "error" in jokes and jokes["error"]:
-            print("Error fetching jokes:", jokes["message"])
+def print_section(title, data, columns, max_width=80):
+    print(f"\n{title}")
+    print("-" * max_width)
+    header = " | ".join(columns)
+    print(header)
+    print("-" * max_width)
+    
+    for item in data:
+        if isinstance(item, tuple):
+            row = [str(x) for x in item]
         else:
-            joke_list = []
-            if isinstance(jokes, dict) and "joke" in jokes:
-                # Single joke response
-                joke_list.append(jokes["joke"])
-            elif isinstance(jokes, dict) and "jokes" in jokes:
-                # Multiple jokes response
-                for joke in jokes["jokes"]:
-                    if joke["type"] == "single":
-                        joke_list.append(joke["joke"])
-                    elif joke["type"] == "twopart":
-                        joke_list.append(f"{joke['setup']} - {joke['delivery']}")
-            return joke_list
+            row = [str(item)]
+        print(" | ".join(row))
+    print("-" * max_width)
 
-    except requests.RequestException as e:
-        print(f"An error occurred: {e}")
-
-    return []
-
-# Fetch jokes repeatedly with Lossy Counting
 def fetch_jokes_repeatedly():
-    lossy_counter = LossyCounting(epsilon=0.01)  # Set epsilon for lossy counting
-    while True:
-        jokes = fetch_jokes(
-            joke_type="single",       # Fetch single jokes
-            blacklist_flags="nsfw",  # Exclude NSFW jokes
-            amount=1                  # Fetch 1 joke at a time
-        )
+    text_processor = TextProcessor()
+    analyzer = EnhancedLossyCounting(epsilon=0.25)
+    iteration = 1
+    
+    try:
+        while True:
+            # Fetch joke
+            try:
+                response = requests.get(BASE_URL, params={"type": "single", "blacklistFlags": "nsfw", "amount": 1})
+                joke = response.json().get('joke', 'No joke found')
+            except Exception as e:
+                joke = f"Error: {e}"
+            
+            # Process text
+            itemsets = text_processor.clean_and_generate_itemsets(joke)
+            
+            # Display processing info
+            print(f"\n{'='*50}\nIteration: {iteration}")
+            print(f"\n[New Joke] {datetime.now().strftime('%H:%M:%S')}:")
+            print(f"{joke}")
+            
+            print_section(
+                "Generated Itemsets (1-4 words)", 
+                itemsets, 
+                ["Itemsets"]
+            )
+            
+            # Add to analyzer
+            analyzer.add(itemsets)
+            
+            # Show frequent itemsets
+            frequent_items = analyzer.get_frequent_itemsets(threshold=2)
+            if frequent_items:
+                sorted_items = sorted(
+                    frequent_items.items(),
+                    key=lambda x: (-x[1]['count'], x[1]['last_seen'])
+                )
+                display_data = [
+                    (
+                        itemset, 
+                        info['count'], 
+                        info['first_seen'].strftime('%H:%M:%S'), 
+                        info['last_seen'].strftime('%H:%M:%S')
+                    )
+                    for itemset, info in sorted_items
+                ]
+                print_section(
+                    "Frequent Itemsets (Count ≥ 2)",
+                    display_data,
+                    ["Itemset", "Count", "First Seen", "Last Seen"]
+                )
+            else:
+                print("\nNo frequent itemsets meeting threshold yet")
+            
+            iteration += 1
+            time.sleep(2)
+    
+    except KeyboardInterrupt:
+        print("\n\nFinal Report:")
+        final_items = analyzer.get_frequent_itemsets(threshold=2)
+        if final_items:
+            sorted_final = sorted(
+                final_items.items(),
+                key=lambda x: (-x[1]['count'], x[1]['last_seen'])
+            )
+            display_data = [
+                (
+                    itemset, 
+                    info['count'], 
+                    info['first_seen'].strftime('%H:%M:%S'), 
+                    info['last_seen'].strftime('%H:%M:%S')
+                )
+                for itemset, info in sorted_final
+            ]
+            print_section(
+                "All Frequent Itemsets (Count ≥ 2)",
+                display_data,
+                ["Itemset", "Count", "First Seen", "Last Seen"]
+            )
+        else:
+            print("No frequent itemsets met the threshold overall")
 
-        for joke in jokes:
-            lossy_counter.add(joke)  # Add joke to Lossy Counting
-            print(f"Fetched Joke: {joke}")
-
-        # Print the current frequencies with a specific threshold
-        threshold = 1  # Define the threshold for frequency
-        print("\n[Current Joke Frequencies]")
-        frequent_items = lossy_counter.get_frequencies(threshold=threshold)
-        for joke, count in frequent_items.items():
-            print(f"{joke}: {count}")
-
-        # Wait 5 seconds before fetching the next joke
-        time.sleep(1)
-
-# Start fetching jokes repeatedly
 fetch_jokes_repeatedly()
